@@ -381,6 +381,96 @@ class gather_cache_kernel {
   const int32_t* __restrict__ seq_starts;  // Optional: starting offsets per
 };
 
+// Kernel for gathering quantized K cache with indexing
+template <typename scalar_t>
+class cp_gather_indexer_k_quant_cache_kernel {
+ public:
+  cp_gather_indexer_k_quant_cache_kernel(
+      const scalar_t* __restrict__ kv_cache, // [num_blocks, block_size, cache_stride]
+      scalar_t* __restrict__ dst_k, // [num_tokens, head_dim]
+      scalar_t* __restrict__ dst_scale, // [num_tokens, head_dim / quant_block_size * 4]
+      const int32_t* __restrict__ block_table, // [batch_size, num_blocks]
+      const int32_t* __restrict__ cu_seq_lens, // [batch_size + 1]
+      int32_t batch_size, // batch size
+      int64_t head_dim, // dimensions of each head
+      int64_t block_stride, // stride for each block in kv_cache
+      int64_t cache_block_size, // num_tokens for each block in kv_cache
+      int32_t num_blocks, // num of blocks
+      int32_t quant_block_size // quantization block size
+    )
+      : kv_cache_(kv_cache),
+        dst_k_(dst_k),
+        dst_scale_(dst_scale),
+        block_table_(block_table),
+        cu_seq_lens_(cu_seq_lens),
+        batch_size_(batch_size),
+        head_dim_(head_dim),
+        block_stride_(block_stride),
+        cache_block_size_(cache_block_size),
+        num_blocks_(num_blocks),
+        quant_block_size_(quant_block_size) {}
+
+  void operator()(const sycl::nd_item<1>& item) const {
+    const int32_t token_idx = item.get_global_id(0);
+
+    // Find which batch this token belongs to
+    int32_t batch_idx = -1;
+    for (int32_t bid = 0; bid < batch_size_; ++bid) {
+      int32_t seq_start = cu_seq_lens_[bid];
+      int32_t seq_end = cu_seq_lens_[bid + 1];
+      if (token_idx >= seq_start && token_idx < seq_end) {
+        batch_idx = bid;
+        break;
+      }
+    }
+
+    if (batch_idx == -1) return;
+
+    // Calculate in-batch sequence index
+    int32_t inbatch_seq_idx = token_idx - cu_seq_lens_[batch_idx];
+
+    // Find which block this token belongs to
+    int32_t block_idx_in_table = inbatch_seq_idx / cache_block_size_;
+    int32_t physical_block_idx = block_table_[batch_idx * num_blocks_ + block_idx_in_table];
+
+    // Calculate offset within the block
+    int32_t inblock_offset = inbatch_seq_idx % cache_block_size_;
+
+    // Calculate source offsets
+    int64_t src_block_offset = physical_block_idx * block_stride_;
+    int64_t src_k_offset = src_block_offset + inblock_offset * head_dim_;
+
+    // Copy K values
+    for (int64_t i = 0; i < head_dim_; ++i) {
+      dst_k_[token_idx * head_dim_ + i] = kv_cache_[src_k_offset + i];
+    }
+
+    // Calculate source offset for scale values
+    // Scales are stored after all K values for the block
+    int64_t scale_size = head_dim_ * 4 / quant_block_size_;
+    int64_t src_scale_offset = src_block_offset + cache_block_size_ * head_dim_ + 
+                                inblock_offset * scale_size;
+
+    // Copy scale values
+    for (int64_t i = 0; i < scale_size; ++i) {
+      dst_scale_[token_idx * scale_size + i] = kv_cache_[src_scale_offset + i];
+    }
+  }
+
+ private:
+  const scalar_t* __restrict__ kv_cache_;      // [num_blocks, block_size, cache_stride]
+  scalar_t* __restrict__ dst_k_;               // [num_tokens, head_dim]
+  scalar_t* __restrict__ dst_scale_;           // [num_tokens, scale_size]
+  const int32_t* __restrict__ block_table_;    // [batch_size, num_blocks]
+  const int32_t* __restrict__ cu_seq_lens_;    // [batch_size + 1]
+  const int32_t batch_size_;
+  const int64_t head_dim_;
+  const int64_t block_stride_;
+  const int64_t cache_block_size_;
+  const int32_t num_blocks_;
+  const int32_t quant_block_size_;
+};
+
 }  // namespace vllm
 
 // KV_T is the stored data type of kv-cache.
@@ -632,6 +722,74 @@ void gather_cache(
     CALL_GATHER_CACHE(uint16_t);
   } else if (dtype_bits == 8) {
     CALL_GATHER_CACHE(uint8_t);
+  } else {
+    TORCH_CHECK(false, "Unsupported data type width: ", dtype_bits);
+  }
+}
+
+// Macro to dispatch the kernel based on the data type
+#define CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(DTYPE)                          \
+  queue.submit([&](sycl::handler& cgh) {                                     \
+    cgh.parallel_for(                                                        \
+        sycl::nd_range<1>(grid * block, block),                              \
+        vllm::cp_gather_indexer_k_quant_cache_kernel<DTYPE>(                 \
+            reinterpret_cast<const DTYPE*>(kv_cache.data_ptr()),             \
+            reinterpret_cast<DTYPE*>(dst_k.data_ptr()),                      \
+            reinterpret_cast<DTYPE*>(dst_scale.data_ptr()),                  \
+            block_table.data_ptr<int32_t>(),                                 \
+            cu_seq_lens.data_ptr<int32_t>(),                                 \
+            batch_size,                                                      \
+            head_dim,                                                        \
+            block_stride,                                                    \
+            cache_block_size,                                                \
+            num_blocks,                                                      \
+            quant_block_size));                                              \
+  });
+
+void cp_gather_indexer_k_quant_cache(
+    torch::Tensor const& kv_cache,      // [num_blocks, block_size, cache_stride]
+    torch::Tensor& dst_k,               // [num_tokens, head_dim]
+    torch::Tensor& dst_scale,           // [num_tokens, scale_size]
+    torch::Tensor const& block_table,   // [batch_size, num_blocks]
+    torch::Tensor const& cu_seq_lens) { // [batch_size + 1]
+  
+  int32_t batch_size = block_table.size(0);
+  int32_t num_tokens = dst_k.size(0);
+  int64_t head_dim = dst_k.size(1);
+  int64_t cache_block_size = kv_cache.size(1);
+  int32_t num_blocks = block_table.size(1);
+  int32_t quant_block_size = head_dim * 4 / dst_scale.size(1);
+  
+  TORCH_CHECK(kv_cache.device() == dst_k.device(),
+              "kv_cache and dst_k must be on the same device");
+  TORCH_CHECK(kv_cache.device() == dst_scale.device(),
+              "kv_cache and dst_scale must be on the same device");
+  TORCH_CHECK(kv_cache.device() == block_table.device(),
+              "kv_cache and block_table must be on the same device");
+  TORCH_CHECK(kv_cache.device() == cu_seq_lens.device(),
+              "kv_cache and cu_seq_lens must be on the same device");
+  TORCH_CHECK(head_dim % quant_block_size == 0,
+              "head_dim must be divisible by quant_block_size");
+  TORCH_CHECK(block_table.dtype() == at::kInt, "block_table must be int32");
+  TORCH_CHECK(cu_seq_lens.dtype() == at::kInt, "cu_seq_lens must be int32");
+  
+  const at::DeviceGuard device_guard(kv_cache.device());
+  auto& queue = vllm::xpu::vllmGetQueue();
+  
+  int64_t block_stride = kv_cache.stride(0);
+  
+  // Launch kernel with one thread per token
+  sycl::range<1> grid((num_tokens + 255) / 256);
+  sycl::range<1> block(256);
+  
+  const int dtype_bits = kv_cache.element_size() * 8;
+  
+  if (dtype_bits == 32) {
+    CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(uint32_t);
+  } else if (dtype_bits == 16) {
+    CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(uint16_t);
+  } else if (dtype_bits == 8) {
+    CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(uint8_t);
   } else {
     TORCH_CHECK(false, "Unsupported data type width: ", dtype_bits);
   }

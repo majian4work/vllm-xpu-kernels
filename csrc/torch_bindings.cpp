@@ -137,6 +137,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
       "Tensor cu_seq_lens, int batch_size, Tensor? seq_starts) -> ()");
   cache_ops.impl("gather_cache", torch::kXPU, &gather_cache);
+  
+  // Gather quantized K cache with indexing
+  cache_ops.def(
+      "cp_gather_indexer_k_quant_cache(Tensor kv_cache, Tensor! dst_k, "
+      "Tensor! dst_scale, Tensor block_table, Tensor cu_seq_lens) -> ()");
+  cache_ops.impl("cp_gather_indexer_k_quant_cache", torch::kXPU, 
+                 &cp_gather_indexer_k_quant_cache);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
