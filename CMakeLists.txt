@@ -18,6 +18,7 @@ set(VLLM_TARGET_DEVICE
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/ccache_distcc_compiler.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
